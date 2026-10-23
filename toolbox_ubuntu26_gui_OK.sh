@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ══════════════════════════════════════════════════════════
-# جعبه‌ابزار لینوکس - نسخه 3.10 با اصلاح حذف NetMon و گزارش عملیات
+# جعبه‌ابزار لینوکس - نسخه 3.12 با NetMon به‌روز شده
 # تمام برنامه‌ها در همین یک فایل مدیریت می‌شوند
 # ══════════════════════════════════════════════════════════
 
@@ -15,7 +15,7 @@ declare -A PROGRAM_NAMES=(
 )
 declare -A PROGRAM_VERSIONS=(
     ["system_update"]="1.0.0"
-    ["netmon"]="1.3.2"
+    ["netmon"]="1.5.3"
     ["persian_keyboard"]="1.0.0"
     ["persian_fonts"]="1.0.0"
     ["useful_apps"]="1.0.0"
@@ -92,7 +92,7 @@ netmon_install() {
     
     cat << 'EOF' > "$deb_dir/DEBIAN/control"
 Package: netmon-speed
-Version: 1.3.2
+Version: 1.5.3
 Architecture: amd64
 Maintainer: Iraj <iraj@localhost>
 Description: نمایشگر سرعت اینترنت با ترازبندی بهینه
@@ -101,75 +101,564 @@ EOF
     
     cat << 'PYEOF' > "$deb_dir/usr/local/bin/netmon.py"
 #!/usr/bin/env python3
-import time, threading
-import pystray
-from PIL import Image, ImageDraw, ImageFont
+"""NetMon speed indicator with live cellular technology and cached operator logo."""
+import io
+import json
 import os
+import re
+import subprocess
+import threading
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+import pystray
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+CACHE_DIR = Path.home() / ".cache" / "netmon" / "operators"
+LOGO_MAX_BYTES = 3 * 1024 * 1024
+LOGO_SIZE = (20, 20)
+ISP_CHECK_INTERVAL = 60  # Recheck ISP identity every minute; route changes force an immediate refresh.
+
+
+def run_command(args, timeout=5):
+    try:
+        result = subprocess.run(args, capture_output=True, text=True,
+                                timeout=timeout, check=False)
+        if result.returncode != 0:
+            return ""
+        # mmcli may emit ANSI color codes even when captured by a subprocess.
+        # Strip them before parsing fields such as "state: connected".
+        return re.sub(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", result.stdout)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def get_default_route_interfaces():
+    """Return only interfaces used by an active IPv4/IPv6 default route."""
+    interfaces = set()
+    for args in (["ip", "-o", "route", "show", "default"],
+                 ["ip", "-6", "-o", "route", "show", "default"]):
+        output = run_command(args)
+        for line in output.splitlines():
+            match = re.search(r"(?:^|\s)dev\s+(\S+)", line)
+            if match:
+                interfaces.add(match.group(1))
+    return interfaces
+
+
+def get_default_route_signature():
+    """Detect Wi-Fi/Ethernet changes, including a new active NetworkManager connection."""
+    parts = []
+    for args in (["ip", "-o", "route", "show", "default"],
+                 ["ip", "-6", "-o", "route", "show", "default"]):
+        parts.append(run_command(args).strip())
+    # Include active connection UUID/name: a new Wi-Fi can reuse the same gateway.
+    parts.append(run_command([
+        "nmcli", "-t", "-f", "NAME,UUID,TYPE,DEVICE", "connection", "show", "--active"
+    ]).strip())
+    return "\n".join(parts)
+
 
 def get_net_stats():
+    interfaces = get_default_route_interfaces()
+    if not interfaces:
+        return 0, 0
     rx, tx = 0, 0
     try:
-        with open('/proc/net/dev', 'r') as f:
+        with open('/proc/net/dev', 'r', encoding='utf-8') as f:
             for line in f.readlines()[2:]:
-                if ':' in line:
-                    stats = line.split(':')[1].split()
-                    rx += int(stats[0])
-                    tx += int(stats[8])
-    except Exception:
+                if ':' not in line:
+                    continue
+                name, values = line.split(':', 1)
+                if name.strip() not in interfaces:
+                    continue
+                stats = values.split()
+                rx += int(stats[0])
+                tx += int(stats[8])
+    except (OSError, ValueError, IndexError):
         pass
     return rx, tx
 
+
 def format_speed(kbps):
+    kbps = max(0, kbps)
     if kbps >= 1024:
         return f"{kbps / 1024:.1f} MB"
     return f"{kbps:.0f} KB"
 
+
 def get_font(size):
-    font_paths = [
+    # Render at the tray's native pixel height to avoid the panel scaling a
+    # 36px raster icon down (which makes text look blurred).
+    for path in (
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSans.ttf"
-    ]
-    for path in font_paths:
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    ):
         if os.path.exists(path):
             try:
                 return ImageFont.truetype(path, size)
-            except:
-                continue
+            except OSError:
+                pass
     return ImageFont.load_default()
+
+
+def get_active_cellular_modem():
+    """Return current operator/access technology only for an active GSM device."""
+    devices = run_command([
+        "nmcli", "-t", "-f", "TYPE,STATE,DEVICE", "device", "status"
+    ])
+    gsm_devices = []
+    for line in devices.splitlines():
+        fields = line.split(":")
+        if len(fields) >= 3 and fields[0] == "gsm" and fields[1].startswith("connected"):
+            gsm_devices.append(":".join(fields[2:]))
+    if not gsm_devices:
+        return None
+
+    modem_list = run_command(["mmcli", "-L"])
+    paths = re.findall(r"/org/freedesktop/ModemManager1/Modem/(\d+)", modem_list)
+    for modem_id in paths:
+        details = run_command(["mmcli", "-m", modem_id], timeout=7)
+        if not details or not re.search(r"state:\s+connected", details):
+            continue
+        tech_match = re.search(r"access tech:\s*([\w+-]+)", details, re.IGNORECASE)
+        operator_match = re.search(r"operator name:\s*(.*?)\s*$", details, re.MULTILINE)
+        operator = operator_match.group(1).strip() if operator_match else ""
+        tech = tech_match.group(1).lower() if tech_match else ""
+        signal_match = re.search(r"signal quality:\s*(\d+)\s*%", details, re.IGNORECASE)
+        signal_quality = max(0, min(100, int(signal_match.group(1)))) if signal_match else None
+        tech_labels = {
+            "gprs": "2G", "edge": "2G", "gsm": "2G",
+            "umts": "3G", "hspa": "3G", "hsdpa": "3G", "hsupa": "3G",
+            "hspa+": "3G", "lte": "4G/LTE", "4g": "4G/LTE",
+            "5gnr": "5G", "nr": "5G",
+        }
+        label = tech_labels.get(tech, "")
+        if not label:
+            if "5g" in tech or "nr" in tech:
+                label = "5G"
+            elif "lte" in tech:
+                label = "4G/LTE"
+            elif any(token in tech for token in ("umts", "hspa", "hsdpa", "hsupa")):
+                label = "3G"
+            elif tech in ("gsm", "gprs", "edge"):
+                label = "2G"
+        return {"operator": operator, "technology": label, "signal_quality": signal_quality, "modem_id": modem_id}
+    return None
+
+
+def safe_operator_key(operator):
+    key = re.sub(r"[^a-z0-9_-]+", "-", operator.lower()).strip("-")
+    return key[:70] or "unknown-operator"
+
+
+# Fixed, exact Wikimedia Commons file titles. No generic image search is used.
+# Sources: current Irancell logo, MCI 2025 brand logo, and Rightel logo from rightel.ir.
+OPERATOR_FILES = {
+    "irancell": "File:MTNirancell-Logo.png",
+    "ایرانسل": "File:MTNirancell-Logo.png",
+    "همراه اول": "File:MCI logo (2025).svg",
+    "mci": "File:MCI logo (2025).svg",
+    "رایتل": "File:شعار شركة رايتل.png",
+    "rightel": "File:شعار شركة رايتل.png",
+}
+LOGO_MODE_FILE = Path.home() / ".config" / "netmon" / "logo_mode"
+LOGO_MODE = "official"
+
+
+def normalize_operator(operator):
+    value = (operator or "").casefold().strip()
+    if "irancell" in value or "ایرانسل" in value or "iran cell service" in value or "as44244" in value:
+        return "irancell"
+    if ("همراه اول" in value or value == "mci" or "as197207" in value
+            or "mobile communication company of iran" in value
+            or "mobile communications company of iran" in value):
+        return "mci"
+    if "rightel" in value or "رایتل" in value:
+        return "rightel"
+    return ""
+
+
+def read_logo_mode():
+    try:
+        value = LOGO_MODE_FILE.read_text(encoding="utf-8").strip().lower()
+        return value if value in {"official", "symbol"} else "official"
+    except OSError:
+        return "official"
+
+
+def set_logo_mode(mode):
+    try:
+        LOGO_MODE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        LOGO_MODE_FILE.write_text(mode + "\n", encoding="utf-8")
+        return True
+    except OSError:
+        return False
+
+
+def get_public_isp_brand():
+    """Infer the access provider from public-IP ASN metadata (not from local Wi-Fi name)."""
+    request = urllib.request.Request(
+        "https://ipconfig.io/json",
+        headers={"User-Agent": "NetMonSpeed/1.5.1 (public ASN provider lookup)"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=6) as response:
+            payload = json.loads(response.read(256 * 1024).decode("utf-8", errors="replace"))
+    except Exception:
+        return ""
+    org = str(payload.get("asn_org", "") or "").strip()
+    asn = str(payload.get("asn", "") or "").strip().upper()
+    searchable = f"{org} {asn}".casefold()
+    # Convert common ASN legal/parent-company names to the customer-facing brand.
+    known_brands = (
+        (("iran cell service and communication company", "as44244", "irancell"), "Irancell"),
+        (("mobile communication company of iran", "mobile communications company of iran", "as197207", "mci"), "همراه اول"),
+        (("rightel", "righ tel"), "رایتل"),
+        (("telecommunication company of iran", "tci"), "مخابرات ایران"),
+        (("shatel",), "شاتل"),
+        (("mobinnet",), "مبین‌نت"),
+        (("asiatech", "asia tech"), "آسیاتک"),
+        (("pars online", "parsonline"), "پارس‌آنلاین"),
+    )
+    for entry in known_brands:
+        terms, brand = entry
+        if any(term in searchable for term in terms):
+            return brand
+    # Avoid inventing a logo when ASN metadata is empty or generic.
+    if not org or org.casefold() in {"unknown", "private network", "not available"}:
+        return ""
+    return org
+
+
+def download_operator_logo(operator):
+    """Fetch only a known exact logo file from Commons and cache both display styles."""
+    key = normalize_operator(operator)
+    if not key:
+        return None
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+
+    official = CACHE_DIR / f"{key}-official.png"
+    symbol = CACHE_DIR / f"{key}-symbol.png"
+    if official.is_file() and symbol.is_file():
+        try:
+            with Image.open(official) as im: im.verify()
+            with Image.open(symbol) as im: im.verify()
+            return official
+        except (OSError, ValueError):
+            for path in (official, symbol):
+                try: path.unlink()
+                except OSError: pass
+
+    file_title = OPERATOR_FILES.get(key)
+    if not file_title:
+        return None
+    headers = {"User-Agent": "NetMonSpeed/1.5.1 (fixed operator logo sources)"}
+    api = "https://commons.wikimedia.org/w/api.php?" + urllib.parse.urlencode({
+        "action": "query", "titles": file_title, "prop": "imageinfo",
+        "iiprop": "url|mime", "iiurlwidth": 512, "format": "json",
+    })
+    try:
+        request = urllib.request.Request(api, headers=headers)
+        with urllib.request.urlopen(request, timeout=8) as response:
+            data = json.loads(response.read(1024 * 1024).decode("utf-8", errors="replace"))
+        pages = data.get("query", {}).get("pages", {})
+        page = next(iter(pages.values()))
+        info = (page.get("imageinfo") or [{}])[0]
+        image_url = info.get("thumburl") or info.get("url")
+        if not image_url or not image_url.startswith("https://"):
+            return None
+        request = urllib.request.Request(image_url, headers=headers)
+        with urllib.request.urlopen(request, timeout=10) as response:
+            raw = response.read(LOGO_MAX_BYTES + 1)
+        if not raw or len(raw) > LOGO_MAX_BYTES:
+            return None
+        with Image.open(io.BytesIO(raw)) as source:
+            source.load()
+            original = source.convert("RGBA")
+        # Trim transparent/white margins before preparing the full logo.
+        alpha = original.getchannel("A")
+        bbox = alpha.getbbox()
+        if bbox:
+            original = original.crop(bbox)
+        # Save full logo at useful resolution; display sizing happens in load_logo().
+        original.thumbnail((512, 512), Image.Resampling.LANCZOS)
+        original.save(official, format="PNG", optimize=True)
+        # Symbol mode is a square crop around the visual center, not a second web search.
+        # This gives a consistent compact comparison; user can switch back to the full mark.
+        w, h = original.size
+        side = min(w, h)
+        # Horizontal wordmarks usually place their standalone emblem on the left;
+        # use that side for the square preview. Nearly-square artwork stays centered.
+        left = 0 if w > h * 1.15 else max(0, (w - side) // 2)
+        top = max(0, (h - side) // 2)
+        cropped = original.crop((left, top, left + side, top + side))
+        cropped.thumbnail((256, 256), Image.Resampling.LANCZOS)
+        cropped.save(symbol, format="PNG", optimize=True)
+        return official
+    except Exception:
+        return None
+
+
+def load_logo(path, mode=None):
+    if not path:
+        return None
+    try:
+        mode = mode or read_logo_mode()
+        path = Path(path)
+        if path.name.endswith("-official.png") and mode == "symbol":
+            path = path.with_name(path.name.replace("-official.png", "-symbol.png"))
+        with Image.open(path) as source:
+            source.load()
+            logo = ImageOps.contain(source.convert("RGBA"), LOGO_SIZE)
+        # Neutral light badge for clear contrast on dark panels.
+        canvas = Image.new("RGBA", LOGO_SIZE, (248, 249, 251, 255))
+        canvas_draw = ImageDraw.Draw(canvas)
+        canvas_draw.rounded_rectangle((0, 0, LOGO_SIZE[0] - 1, LOGO_SIZE[1] - 1),
+                                      radius=4, fill=(248, 249, 251, 255),
+                                      outline=(205, 211, 219, 255), width=1)
+        canvas.alpha_composite(logo, ((LOGO_SIZE[0] - logo.width) // 2,
+                                      (LOGO_SIZE[1] - logo.height) // 2))
+        return canvas
+    except (OSError, ValueError):
+        return None
+
+
+def choose_logo_mode(icon, mode):
+    """Switch persisted logo mode and refresh the tray image immediately."""
+    if set_logo_mode(mode):
+        icon.notify("حالت لوگو: " + ("نمادمحور" if mode == "symbol" else "رسمی کامل"), "NetMon")
+        icon.update_menu()
+
+
+def menu_mode_label(item):
+    return "✓ " + ("نمادمحور" if read_logo_mode() == "symbol" else "لوگوی رسمی کامل")
+
 
 def update_loop(icon):
     last_rx, last_tx = get_net_stats()
     font = get_font(16)
     padding = 2
+    last_cellular_signature = None
+    logo = None
+    operator = ""
+    technology = ""
+    signal_quality = None
+    cellular = None
+    last_cellular_check = 0.0
+    last_isp_check = -ISP_CHECK_INTERVAL
+    isp_brand = ""
+    last_logo_source = None
+    last_logo_attempt = 0.0
+    last_route_signature = None
+    last_logo_mode = read_logo_mode()
 
     while True:
         time.sleep(1)
         curr_rx, curr_tx = get_net_stats()
-        speed_rx_kbps = (curr_rx - last_rx) / 1024
-        speed_tx_kbps = (curr_tx - last_tx) / 1024
+        speed_rx_kbps = max(0.0, (curr_rx - last_rx) / 1024)
+        speed_tx_kbps = max(0.0, (curr_tx - last_tx) / 1024)
         last_rx, last_tx = curr_rx, curr_tx
-        
+
+        # Refresh network identity promptly after changing Wi-Fi/router/provider.
+        now = time.monotonic()
+        route_signature = get_default_route_signature()
+        route_changed = (last_route_signature is not None and
+                         route_signature != last_route_signature)
+        if route_signature != last_route_signature:
+            last_route_signature = route_signature
+        if route_changed:
+            # Never keep showing the previous provider while the new one is being detected.
+            logo = None
+            last_logo_source = None
+            isp_brand = ""
+            last_isp_check = -ISP_CHECK_INTERVAL
+
+        # Keep the speed refresh at one second, but query ModemManager only every 5 seconds.
+        if now - last_cellular_check >= 5 or route_changed:
+            cellular = get_active_cellular_modem()
+            last_cellular_check = now
+            signature = None
+            if cellular:
+                # When the OS has an active cellular connection, prefer the modem's
+                # actual operator and avoid the extra public-IP lookup.
+                operator = cellular.get("operator", "")
+                technology = cellular.get("technology", "")
+                signal_quality = cellular.get("signal_quality")
+                signature = ("cellular", cellular.get("modem_id", ""), operator.casefold())
+                # Retry a failed logo load periodically even if the operator name
+                # stays the same. This avoids getting stuck with an empty logo after
+                # a transient download/cache/read failure. Never retry more often
+                # than once every 15 seconds.
+                if (signature != last_cellular_signature or
+                        (operator and not logo and now - last_logo_attempt >= 15)):
+                    last_cellular_signature = signature
+                    last_logo_source = signature
+                    if operator:
+                        last_logo_attempt = now
+                        logo_path = download_operator_logo(operator)
+                        logo = load_logo(logo_path, read_logo_mode())
+                    else:
+                        logo = None
+            else:
+                last_cellular_signature = None
+                operator = ""
+                technology = ""
+                signal_quality = None
+                # On Wi-Fi/Ethernet, infer the provider from public-IP ASN metadata.
+                # Recheck periodically and immediately after a route/connection change.
+                if now - last_isp_check >= ISP_CHECK_INTERVAL or route_changed:
+                    isp_brand = get_public_isp_brand()
+                    last_isp_check = now
+                signature = ("isp", isp_brand.casefold()) if isp_brand else None
+                if (signature != last_logo_source or
+                        (isp_brand and not logo and now - last_logo_attempt >= 15)):
+                    last_logo_source = signature
+                    # Clear the previous provider's logo even if the new ISP is unknown
+                    # or does not have one of the explicitly supported logos.
+                    if isp_brand:
+                        last_logo_attempt = now
+                        logo_path = download_operator_logo(isp_brand)
+                        logo = load_logo(logo_path, read_logo_mode())
+                    else:
+                        logo = None
+
+        current_logo_mode = read_logo_mode()
+        if current_logo_mode != last_logo_mode:
+            last_logo_mode = current_logo_mode
+            if cellular and operator:
+                logo = load_logo(download_operator_logo(operator), current_logo_mode)
+            elif isp_brand:
+                logo = load_logo(download_operator_logo(isp_brand), current_logo_mode)
+
         rx_str = format_speed(speed_rx_kbps)
         tx_str = format_speed(speed_tx_kbps)
-        text = f"\u2191 {tx_str}  \u2193 {rx_str}"
-        
-        temp_img = Image.new('RGB', (1, 1))
-        bbox = ImageDraw.Draw(temp_img).textbbox((0, 0), text, font=font)
-        text_width = bbox[2] - bbox[0]
-        text_height = bbox[3] - bbox[1]
-        
-        img_w = text_width + (padding * 2)
-        img_h = text_height + (padding * 2)
-        img = Image.new('RGB', (img_w, img_h), color=(25, 25, 25))
+        # Build a more polished, dark-theme-friendly status icon: colored signal
+        # bars, cached operator artwork, white technology label, and distinct
+        # green/blue traffic arrows. Keep the image compact for the top panel.
+        font = get_font(10)
+        small_font = get_font(10)
+        pad = 4
+        gap = 5
+        bar_width = 2
+        bar_gap = 2
+        bar_heights = (4, 7, 10, 13)
+        # Signal bars represent ModemManager's reported signal quality.
+        # Without a connected cellular modem, keep the signal graphic hidden.
+        active_bars = (max(1, min(4, (signal_quality + 24) // 25))
+                       if cellular and signal_quality is not None and signal_quality > 0 else 0)
+        signal_w = (len(bar_heights) * bar_width + (len(bar_heights) - 1) * bar_gap) if cellular else 0
+        # Render the cellular generation inside the signal-strength graphic
+        # instead of as a separate, visually noisy label.
+        tech = technology if cellular else ""
+        tech_label = {
+            "4G/LTE": "4G", "LTE": "4G", "4G": "4G",
+            "3G": "3G", "2G": "2G", "5G": "5G",
+        }.get(tech, tech.upper()[:3] if tech else "")
+        tx_box = ImageDraw.Draw(Image.new("RGB", (1, 1))).textbbox((0, 0), tx_str, font=small_font)
+        rx_box = ImageDraw.Draw(Image.new("RGB", (1, 1))).textbbox((0, 0), rx_str, font=small_font)
+        tx_w = tx_box[2] - tx_box[0]
+        rx_w = rx_box[2] - rx_box[0]
+        arrow_w = 8
+        traffic_w = arrow_w + 2 + tx_w + gap + arrow_w + 2 + rx_w
+        logo_w = LOGO_SIZE[0] if logo else 0
+        sep_w = 1 if cellular else 0
+        img_w = pad * 2 + signal_w + (gap if cellular else 0)
+        if logo:
+            img_w += logo_w + gap
+        # No separate technology text box: the compact label is drawn with
+        # the signal bars below, keeping the tray icon narrower.
+        if cellular:
+            img_w += sep_w + gap
+        img_w += traffic_w
+        img_h = 24
+        img = Image.new('RGB', (img_w, img_h), color=(24, 27, 32))
         draw = ImageDraw.Draw(img)
-        draw.text((padding, padding - 2), text, fill=(0, 255, 120), font=font)
+        x = pad
+        # Windows-7-inspired glossy signal bars; active count follows real modem quality.
+        if cellular:
+            base_y = img_h - 3
+            for index, h in enumerate(bar_heights):
+                active = index < active_bars
+                fill = (32, 205, 111) if active else (66, 74, 83)
+                highlight = (151, 255, 190) if active else (112, 119, 128)
+                bx = x
+                draw.rounded_rectangle((bx, base_y - h, bx + bar_width - 1, base_y),
+                                       radius=1, fill=fill)
+                if h >= 7:
+                    draw.line((bx, base_y - h + 1, bx, base_y - 2), fill=highlight, width=1)
+                x += bar_width + bar_gap
+            x += gap - bar_gap
+            # Small, high-contrast generation label integrated with the bars.
+            # Place it immediately above the bars so it reads as one signal icon.
+            if tech_label:
+                label_font = get_font(8)
+                label_box = draw.textbbox((0, 0), tech_label, font=label_font)
+                label_w = label_box[2] - label_box[0]
+                label_h = label_box[3] - label_box[1]
+                label_x = pad + max(0, (signal_w - label_w) // 2)
+                label_y = 0
+                draw.rounded_rectangle(
+                    (label_x - 1, label_y, label_x + label_w + 1, label_y + label_h + 1),
+                    radius=1, fill=(24, 27, 32)
+                )
+                draw.text((label_x, label_y), tech_label,
+                          fill=(245, 247, 250), font=label_font)
+        if logo:
+            img.paste(logo, (x, (img_h - LOGO_SIZE[1]) // 2), logo)
+            x += logo_w + gap
+        # Upload/download: clean, compact beveled arrows inspired by Windows 7.
+        # Use filled polygons (not overlapping thick lines) so the shapes stay crisp
+        # at the 24px panel-icon size.
+        mid_y = img_h // 2
+        up_x = x
+        # soft shadow, then a bright green upward arrow
+        draw.polygon([(up_x + 3, mid_y - 5), (up_x + 7, mid_y - 1),
+                      (up_x + 5, mid_y - 1), (up_x + 5, mid_y + 5),
+                      (up_x + 1, mid_y + 5), (up_x + 1, mid_y - 1),
+                      (up_x - 1, mid_y - 1)], fill=(8, 45, 28))
+        draw.polygon([(up_x + 3, mid_y - 5), (up_x + 6, mid_y - 2),
+                      (up_x + 4, mid_y - 2), (up_x + 4, mid_y + 4),
+                      (up_x + 2, mid_y + 4), (up_x + 2, mid_y - 2),
+                      (up_x, mid_y - 2)], fill=(54, 220, 112))
+        draw.line((up_x + 2, mid_y + 3, up_x + 2, mid_y - 1), fill=(177, 255, 192), width=1)
+        x += arrow_w + 2
+        draw.text((x, (img_h - 10) // 2 - 1), tx_str, fill=(240, 243, 247), font=small_font)
+        x += tx_w + gap
+        down_x = x
+        # matching glossy blue downward arrow
+        draw.polygon([(down_x + 3, mid_y + 5), (down_x + 7, mid_y + 1),
+                      (down_x + 5, mid_y + 1), (down_x + 5, mid_y - 5),
+                      (down_x + 1, mid_y - 5), (down_x + 1, mid_y + 1),
+                      (down_x - 1, mid_y + 1)], fill=(12, 35, 70))
+        draw.polygon([(down_x + 3, mid_y + 5), (down_x + 6, mid_y + 2),
+                      (down_x + 4, mid_y + 2), (down_x + 4, mid_y - 4),
+                      (down_x + 2, mid_y - 4), (down_x + 2, mid_y + 2),
+                      (down_x, mid_y + 2)], fill=(62, 157, 255))
+        draw.line((down_x + 2, mid_y - 3, down_x + 2, mid_y + 1), fill=(183, 222, 255), width=1)
+        x += arrow_w + 2
+        draw.text((x, (img_h - 10) // 2 - 1), rx_str, fill=(240, 243, 247), font=small_font)
         icon.icon = img
+        icon.title = f"NetMon | {technology}" if cellular and technology else "NetMon Speed"
+
 
 def main():
     init_img = Image.new('RGB', (40, 24), color=(25, 25, 25))
-    icon = pystray.Icon("netmon", init_img, "مانیتور شبکه‌ی ایرج")
+    menu = pystray.Menu(
+        pystray.MenuItem("حالت لوگو", lambda icon, item: None, enabled=False),
+        pystray.MenuItem("لوگوی رسمی کامل", lambda icon, item: choose_logo_mode(icon, "official"),
+                         checked=lambda item: read_logo_mode() == "official"),
+        pystray.MenuItem("نمادمحور (برش مربعی)", lambda icon, item: choose_logo_mode(icon, "symbol"),
+                         checked=lambda item: read_logo_mode() == "symbol"),
+    )
+    icon = pystray.Icon("netmon", init_img, "NetMon Speed", menu=menu)
     threading.Thread(target=update_loop, args=(icon,), daemon=True).start()
     icon.run()
 
@@ -201,8 +690,8 @@ NoDisplay=false
 X-GNOME-Autostart-enabled=true
 EOF
     
-    dpkg-deb --build "$deb_dir" "$tmp_dir/netmon-speed_1.3.2_amd64.deb" 2>/dev/null
-    sudo -A dpkg -i "$tmp_dir/netmon-speed_1.3.2_amd64.deb" 2>/dev/null
+    dpkg-deb --build "$deb_dir" "$tmp_dir/netmon-speed_1.5.3_amd64.deb" 2>/dev/null
+    sudo -A dpkg -i "$tmp_dir/netmon-speed_1.5.3_amd64.deb" 2>/dev/null
     sudo -A apt-get install -f -y 2>/dev/null
     
     echo ""
@@ -292,12 +781,16 @@ netmon_uninstall() {
 netmon_update() {
     echo ""
     echo "بررسی بروزرسانی..."
-    echo "  نسخه فعلی: 1.3.2"
-    echo "  آخرین نسخه: 1.3.2"
+    echo "  نسخه فعلی: 1.5.3"
+    echo "  آخرین نسخه: 1.5.3"
     echo ""
     echo "✓ شما از آخرین نسخه استفاده می‌کنید."
     echo ""
 }
+
+# ──────────────────────────────────────────────────────────
+# نرم‌افزارهای کاربردی (Ubuntu 24/26)
+# ──────────────────────────────────────────────────────────
 
 # ──────────────────────────────────────────────────────────
 # نرم‌افزارهای کاربردی (Ubuntu 24/26)
